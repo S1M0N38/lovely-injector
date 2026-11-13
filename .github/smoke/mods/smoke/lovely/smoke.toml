@@ -1,0 +1,15 @@
+# Smoke-test mod: the patch must be applied to the "@main.lua" chunk that
+# .github/smoke/lua_host.c loads. If lovely is loaded and patching works, the
+# chunk prints LOVELY_SMOKE_OK instead of just HOST_RAN.
+[manifest]
+version = "1.0.0"
+priority = 0
+
+[[patches]]
+[patches.pattern]
+target = "main.lua"
+pattern = "print('HOST_RAN')"
+position = "at"
+payload = "print('HOST_RAN')\nprint('LOVELY_SMOKE_OK')"
+match_indent = true
+times = 1
