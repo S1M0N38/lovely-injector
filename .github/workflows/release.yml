@@ -185,12 +185,176 @@ jobs:
           path: lovely-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
+  # Same sources, but linked against glibc 2.17 stubs (zig's libc), so the
+  # artifact loads on old distros and minimal container bases (debian:11/12,
+  # ubuntu:20.04/22.04, Apple `container` default images).
+  build-linux-glibc217:
+    name: Linux glibc 2.17 (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Setup toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-11-10
+          target: ${{ matrix.target }}
+
+      - name: Show toolchain
+        run: rustc -Vv && rustup show active-toolchain
+
+      - name: Install zig + cargo-zigbuild
+        run: |
+          set -euo pipefail
+          python3 -m venv "$HOME/.zigvenv"
+          "$HOME/.zigvenv/bin/pip" install --quiet --disable-pip-version-check 'cargo-zigbuild==0.24.1' 'ziglang==0.17.1'
+          # The ziglang wheel only ships `python -m ziglang`; give cargo-zigbuild a
+          # plain `zig` on PATH.
+          mkdir -p "$HOME/.local/bin"
+          printf '#!/bin/sh\nexec "%s" -m ziglang "$@"\n' "$HOME/.zigvenv/bin/python" > "$HOME/.local/bin/zig"
+          chmod +x "$HOME/.local/bin/zig"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.zigvenv/bin" >> "$GITHUB_PATH"
+          ls "$HOME/.zigvenv/bin"
+          "$HOME/.local/bin/zig" version
+          "$HOME/.zigvenv/bin/cargo-zigbuild" --version
+
+      - name: Build
+        env:
+          # cargo-zigbuild sets CC_<target>/CXX_<target> to `zig cc`, so the
+          # Dobby cmake build is compiled against the same glibc 2.17 stubs.
+          # SDKROOT must not leak in from a mac-oriented environment.
+          SDKROOT: ""
+        run: cargo zigbuild --target ${{ matrix.target }}.2.17 --package lovely-unix --release
+
+      - name: Verify binary and glibc floor
+        run: |
+          set -euo pipefail
+          lib="target/${{ matrix.target }}/release/liblovely.so"
+          file "$lib"
+          max=$(strings -a "$lib" | grep -oE 'GLIBC_2\.[0-9]+' | sort -uV | tail -1)
+          echo "highest required symbol version: ${max:-none}"
+          if [ -n "$max" ]; then
+            highest=$(printf '%s\n' GLIBC_2.17 "$max" | sort -uV | tail -1)
+            if [ "$highest" != "GLIBC_2.17" ]; then
+              echo "::error::expected a glibc 2.17 floor, but $max is required"
+              exit 1
+            fi
+          fi
+
+      - name: Compress tar.gz
+        run: |
+          cp ./crates/lovely-unix/run_lovely_linux.sh ./target/${{ matrix.target }}/release/
+          cd ./target/${{ matrix.target }}/release/
+          tar czf "lovely-${{ matrix.target }}-glibc2.17.tar.gz" liblovely.so run_lovely_linux.sh
+          mv "lovely-${{ matrix.target }}-glibc2.17.tar.gz" "$GITHUB_WORKSPACE"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: lovely-${{ matrix.target }}-glibc2.17
+          path: lovely-${{ matrix.target }}-glibc2.17.tar.gz
+          if-no-files-found: error
+
+  # Proves the artifacts work in the environments people actually run them in.
+  # The "fail" entries pin the glibc floor: the native build must not load on
+  # debian:12, the glibc2.17 build must.
+  smoke:
+    name: Smoke ${{ matrix.artifact }} on ${{ matrix.image }}
+    needs:
+      - build-linux
+      - build-linux-glibc217
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            image: ubuntu:24.04
+            artifact: lovely-x86_64-unknown-linux-gnu
+            expect: pass
+          - runner: ubuntu-24.04
+            image: debian:12-slim
+            artifact: lovely-x86_64-unknown-linux-gnu-glibc2.17
+            expect: pass
+          - runner: ubuntu-24.04
+            image: debian:12-slim
+            artifact: lovely-x86_64-unknown-linux-gnu
+            expect: fail
+          - runner: ubuntu-24.04-arm
+            image: ubuntu:24.04
+            artifact: lovely-aarch64-unknown-linux-gnu
+            expect: pass
+          - runner: ubuntu-24.04-arm
+            image: debian:12-slim
+            artifact: lovely-aarch64-unknown-linux-gnu-glibc2.17
+            expect: pass
+          - runner: ubuntu-24.04-arm
+            image: ubuntu:22.04
+            artifact: lovely-aarch64-unknown-linux-gnu-glibc2.17
+            expect: pass
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+
+      - name: Run container smoke test
+        run: bash .github/smoke/run.sh "${{ matrix.image }}" "${{ matrix.expect }}"
+
+  checksums:
+    name: SHA256SUMS
+    needs:
+      - build-windows
+      - build-mac
+      - build-linux
+      - build-linux-glibc217
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -l
+          sha256sum -- * | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload SHA256SUMS
+        uses: actions/upload-artifact@v7
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+
   publish:
     name: Draft release (${{ github.ref_name }})
     needs:
       - build-windows
       - build-mac
       - build-linux
+      - build-linux-glibc217
+      - checksums
     # Tag pushes always publish (as a draft); manual runs only when asked.
     if: github.event_name == 'push' || inputs.publish
     runs-on: ubuntu-24.04
@@ -221,9 +385,13 @@ jobs:
           --|--|
           Mac (Arm)|[lovely-aarch64-apple-darwin.tar.gz](https://github.com/REPO/releases/download/TAG/lovely-aarch64-apple-darwin.tar.gz)|
           Mac (x86)|[lovely-x86_64-apple-darwin.tar.gz](https://github.com/REPO/releases/download/TAG/lovely-x86_64-apple-darwin.tar.gz)|
-          Linux (x86)|[lovely-x86_64-unknown-linux-gnu.tar.gz](https://github.com/REPO/releases/download/TAG/lovely-x86_64-unknown-linux-gnu.tar.gz)|
-          Linux (Arm)|[lovely-aarch64-unknown-linux-gnu.tar.gz](https://github.com/REPO/releases/download/TAG/lovely-aarch64-unknown-linux-gnu.tar.gz)|
+          Linux (x86, glibc 2.38+)|[lovely-x86_64-unknown-linux-gnu.tar.gz](https://github.com/REPO/releases/download/TAG/lovely-x86_64-unknown-linux-gnu.tar.gz)|
+          Linux (Arm, glibc 2.34+)|[lovely-aarch64-unknown-linux-gnu.tar.gz](https://github.com/REPO/releases/download/TAG/lovely-aarch64-unknown-linux-gnu.tar.gz)|
+          Linux (x86, glibc 2.17+)|[lovely-x86_64-unknown-linux-gnu-glibc2.17.tar.gz](https://github.com/REPO/releases/download/TAG/lovely-x86_64-unknown-linux-gnu-glibc2.17.tar.gz)|
+          Linux (Arm, glibc 2.17+)|[lovely-aarch64-unknown-linux-gnu-glibc2.17.tar.gz](https://github.com/REPO/releases/download/TAG/lovely-aarch64-unknown-linux-gnu-glibc2.17.tar.gz)|
           Windows|[lovely-x86_64-pc-windows-msvc.zip](https://github.com/REPO/releases/download/TAG/lovely-x86_64-pc-windows-msvc.zip)|
+
+          Checksums: [SHA256SUMS](https://github.com/REPO/releases/download/TAG/SHA256SUMS)
           EOF
           sed -i -E "s/^[[:space:]]+//; s|REPO|${{ github.repository }}|g; s|TAG|$TAG|g" NOTE.md
           cat NOTE.md
