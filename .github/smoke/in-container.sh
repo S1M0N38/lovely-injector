@@ -9,7 +9,8 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends gcc libc6-dev libluajit-5.1-2 >/dev/null
 
-gcc -O1 -o /tmp/lua_host /smoke/lua_host.c -ldl
+# _GNU_SOURCE: RTLD_DEFAULT is only visible with __USE_GNU on older glibc
+gcc -O1 -D_GNU_SOURCE -o /tmp/lua_host /smoke/lua_host.c -ldl
 
 mkdir -p /mods
 cp -r /smoke/mods/. /mods/
