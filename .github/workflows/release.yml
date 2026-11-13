@@ -4,135 +4,158 @@ on:
   push:
     tags:
       - "v[0-9]+.*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Create the draft release and upload assets (off = build-only dry run)"
+        type: boolean
+        default: false
+      tag:
+        description: "Tag to publish (only used when publish is on; defaults to the ref name)"
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  # Pinned on purpose: `rust-toolchain.toml` asks rustup for the floating
+  # "nightly" channel, and RUSTUP_TOOLCHAIN wins over that file. This keeps
+  # rebuilds of an old tag on the same compiler.
+  RUSTUP_TOOLCHAIN: nightly-2026-11-10
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  prepare:
-    name: Create draft release
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-        # Yes, this is the lazy way of doing it. Am I lazy? Yes.
-      - name: Create draft release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          cat <<-'EOF' > NOTE.md
-          ## [Install guide](https://github.com/ethangreen-dev/lovely-injector?tab=readme-ov-file#manual-installation)
-          OS|Download|
-          --|--|
-          Windows|[lovely-x86_64-pc-windows-msvc.zip](https://github.com/ethangreen-dev/lovely-injector/releases/download/${{ github.ref_name }}/lovely-x86_64-pc-windows-msvc.zip)|
-          Mac (Arm)|[lovely-aarch64-apple-darwin.tar.gz](https://github.com/ethangreen-dev/lovely-injector/releases/download/${{ github.ref_name }}/lovely-aarch64-apple-darwin.tar.gz)|
-          Mac (x86)|[lovely-x86_64-apple-darwin.tar.gz](https://github.com/ethangreen-dev/lovely-injector/releases/download/${{ github.ref_name }}/lovely-x86_64-apple-darwin.tar.gz)|
-          Linux|[lovely-x86_64-unknown-linux-gnu.tar.gz](https://github.com/ethangreen-dev/lovely-injector/releases/download/${{ github.ref_name }}/lovely-x86_64-unknown-linux-gnu.tar.gz)|
-          EOF
-
-          gh release create ${{ github.ref_name }} \
-          --title "${{ github.ref_name }}" \
-          --draft  \
-          --generate-notes \
-          --notes-file NOTE.md \
-
   build-windows:
-    needs: prepare
+    name: Windows (${{ matrix.target }})
     runs-on: windows-latest
     strategy:
+      fail-fast: false
       matrix:
         target:
           - x86_64-pc-windows-msvc
-
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Setup toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-11-10
           target: ${{ matrix.target }}
 
+      - name: Show toolchain
+        shell: bash
+        run: rustc -Vv && rustup show active-toolchain
+
       - name: Build
+        shell: bash
         run: cargo build --target ${{ matrix.target }} --package lovely-win --release
 
       - name: Compress
+        shell: bash
         run: |
-          cd ./target/${{ matrix.target }}/release/
-          7z a "lovely-${{ matrix.target }}.zip" version.dll
-          mv "lovely-${{ matrix.target }}.zip" ${{ github.workspace }}
+          set -euo pipefail
+          cd "target/${{ matrix.target }}/release"
+          dll=""
+          for candidate in winmm.dll version.dll; do
+            if [ -f "$candidate" ]; then dll="$candidate"; break; fi
+          done
+          if [ -z "$dll" ]; then
+            echo "::error::no injector dll produced by lovely-win"
+            ls -la
+            exit 1
+          fi
+          echo "packaging $dll"
+          7z a "lovely-${{ matrix.target }}.zip" "$dll"
+          mv "lovely-${{ matrix.target }}.zip" "$GITHUB_WORKSPACE"
 
-      - name: Submit build artifact
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: >-
-          gh release upload ${{ github.ref_name }} lovely-${{ matrix.target }}.zip
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: lovely-${{ matrix.target }}
+          path: lovely-${{ matrix.target }}.zip
+          if-no-files-found: error
 
   build-mac:
-    needs: prepare
+    name: macOS (${{ matrix.target }})
     strategy:
+      fail-fast: false
       matrix:
         target:
-          - x86_64-apple-darwin
           - aarch64-apple-darwin
-    runs-on: ubuntu-latest
+          - x86_64-apple-darwin
+    # macos-latest is arm64: the x86_64 slice is a cross-build with Apple's
+    # own SDK/clang, which is exactly what upstream does on master.
+    runs-on: macos-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Setup toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-11-10
           target: ${{ matrix.target }}
 
-      - name: Install Mac SDK
-        run: |
-          curl -L "https://github.com/phracker/MacOSX-SDKs/releases/download/11.3/MacOSX10.9.sdk.tar.xz" | tar -J -x -C /opt
-          curl -L "https://github.com/phracker/MacOSX-SDKs/releases/download/11.3/MacOSX11.3.sdk.tar.xz" | tar -J -x -C /opt
-          echo "SDKROOT=/opt/MacOSX11.3.sdk" >> $GITHUB_ENV
-
-      - name: Install cargo-zigbuild
-        run: |
-          pip3 install ziglang==0.13.0.post1 cargo-zigbuild
+      - name: Show toolchain
+        run: rustc -Vv && rustup show active-toolchain
 
       - name: Build
-        run: cargo zigbuild --target ${{ matrix.target }} --package lovely-unix --release
+        run: cargo build --target ${{ matrix.target }} --package lovely-unix --release
+
+      - name: Verify binary
+        run: file "target/${{ matrix.target }}/release/liblovely.dylib"
 
       - name: Compress tar.gz
         run: |
           cp ./crates/lovely-unix/run_lovely_macos.sh ./target/${{ matrix.target }}/release/
           cd ./target/${{ matrix.target }}/release/
-          tar czfv lovely-${{ matrix.target }}.tar.gz liblovely.dylib run_lovely_macos.sh
-          mv "lovely-${{ matrix.target }}.tar.gz" ${{ github.workspace }}
+          tar czf "lovely-${{ matrix.target }}.tar.gz" liblovely.dylib run_lovely_macos.sh
+          mv "lovely-${{ matrix.target }}.tar.gz" "$GITHUB_WORKSPACE"
 
-      - name: Submit build artifact
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: >-
-          gh release upload ${{ github.ref_name }} lovely-${{ matrix.target }}.tar.gz
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: lovely-${{ matrix.target }}
+          path: lovely-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
 
   build-linux:
-    needs: prepare
+    name: Linux (${{ matrix.target }})
     strategy:
+      fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-    runs-on: ubuntu-latest
+        include:
+          # Native GitHub-hosted arm64 runner: no cross-compilation, which is
+          # what upstream master does (just for one arch).
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Setup toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-11-10
           target: ${{ matrix.target }}
+
+      - name: Show toolchain
+        run: rustc -Vv && rustup show active-toolchain
 
       - name: install gcc 14
         run: |
@@ -145,15 +168,69 @@ jobs:
       - name: Build
         run: cargo build --target ${{ matrix.target }} --package lovely-unix --release
 
+      - name: Verify binary
+        run: file "target/${{ matrix.target }}/release/liblovely.so"
+
       - name: Compress tar.gz
         run: |
           cp ./crates/lovely-unix/run_lovely_linux.sh ./target/${{ matrix.target }}/release/
           cd ./target/${{ matrix.target }}/release/
-          tar czfv lovely-${{ matrix.target }}.tar.gz liblovely.so run_lovely_linux.sh
-          mv "lovely-${{ matrix.target }}.tar.gz" ${{ github.workspace }}
+          tar czf "lovely-${{ matrix.target }}.tar.gz" liblovely.so run_lovely_linux.sh
+          mv "lovely-${{ matrix.target }}.tar.gz" "$GITHUB_WORKSPACE"
 
-      - name: Submit build artifact
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: lovely-${{ matrix.target }}
+          path: lovely-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Draft release (${{ github.ref_name }})
+    needs:
+      - build-windows
+      - build-mac
+      - build-linux
+    # Tag pushes always publish (as a draft); manual runs only when asked.
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Show artifacts
+        run: ls -l dist
+
+      - name: Create or update draft release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: >-
-          gh release upload ${{ github.ref_name }} lovely-${{ matrix.target }}.tar.gz
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9] ]]; then
+            echo "::error::refusing to publish non-version tag '$TAG'"
+            exit 1
+          fi
+
+          cat <<-'EOF' > NOTE.md
+          ## [Install guide](https://github.com/REPO?tab=readme-ov-file#manual-installation)
+          OS|Download|
+          --|--|
+          Mac (Arm)|[lovely-aarch64-apple-darwin.tar.gz](https://github.com/REPO/releases/download/TAG/lovely-aarch64-apple-darwin.tar.gz)|
+          Mac (x86)|[lovely-x86_64-apple-darwin.tar.gz](https://github.com/REPO/releases/download/TAG/lovely-x86_64-apple-darwin.tar.gz)|
+          Linux (x86)|[lovely-x86_64-unknown-linux-gnu.tar.gz](https://github.com/REPO/releases/download/TAG/lovely-x86_64-unknown-linux-gnu.tar.gz)|
+          Linux (Arm)|[lovely-aarch64-unknown-linux-gnu.tar.gz](https://github.com/REPO/releases/download/TAG/lovely-aarch64-unknown-linux-gnu.tar.gz)|
+          Windows|[lovely-x86_64-pc-windows-msvc.zip](https://github.com/REPO/releases/download/TAG/lovely-x86_64-pc-windows-msvc.zip)|
+          EOF
+          sed -i -E "s/^[[:space:]]+//; s|REPO|${{ github.repository }}|g; s|TAG|$TAG|g" NOTE.md
+          cat NOTE.md
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file NOTE.md
+          else
+            gh release create "$TAG" --title "$TAG" --draft --generate-notes --notes-file NOTE.md
+          fi
+          gh release upload "$TAG" dist/* --clobber
