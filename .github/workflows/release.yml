@@ -218,8 +218,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m venv "$HOME/.zigvenv"
-          "$HOME/.zigvenv/bin/pip" install --quiet --disable-pip-version-check \\
-            'cargo-zigbuild==0.24.1' 'ziglang==0.17.1'
+          "$HOME/.zigvenv/bin/pip" install --quiet --disable-pip-version-check 'cargo-zigbuild==0.24.1' 'ziglang==0.17.1'
           echo "$HOME/.zigvenv/bin" >> "$GITHUB_PATH"
           "$HOME/.zigvenv/bin/zig" version
           "$HOME/.zigvenv/bin/cargo-zigbuild" --version
