@@ -236,6 +236,9 @@ jobs:
           # Dobby cmake build is compiled against the same glibc 2.17 stubs.
           # SDKROOT must not leak in from a mac-oriented environment.
           SDKROOT: ""
+          # zig strips by default; keep the symbol table so lovely crash reports
+          # from the compat build are still readable, like the native ones.
+          RUSTFLAGS: "-C link-arg=-fno-strip"
         run: cargo zigbuild --target ${{ matrix.target }}.2.17 --package lovely-unix --release
 
       - name: Verify binary and glibc floor
@@ -300,7 +303,7 @@ jobs:
             artifact: lovely-aarch64-unknown-linux-gnu-glibc2.17
             expect: pass
           - runner: ubuntu-24.04-arm
-            image: debian:11-slim
+            image: ubuntu:22.04
             artifact: lovely-aarch64-unknown-linux-gnu-glibc2.17
             expect: pass
     runs-on: ${{ matrix.runner }}
